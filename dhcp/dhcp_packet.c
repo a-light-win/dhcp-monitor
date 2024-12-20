@@ -2,7 +2,6 @@
 
 #include <linux/types.h>
 
-#include <arpa/inet.h>
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 #include <linux/bpf.h>
@@ -153,7 +152,7 @@ void fetch_dhcp_option(struct dhcp_options *options, __u8 option_type,
       __u32 len = options->options[i].data_len < buffer_size
                       ? options->options[i].data_len
                       : buffer_size;
-      __builtin_memcpy(buffer, options->options[i].data_begin, len);
+      bpf_probe_read(buffer, len, options->options[i].data_begin);
       return;
     }
   }
@@ -167,7 +166,7 @@ void fetch_dhcp_option_str(struct dhcp_options *options, __u8 option_type,
       __u32 len = options->options[i].data_len < (buffer_size - 1)
                       ? options->options[i].data_len
                       : (buffer_size - 1);
-      __builtin_memcpy(buffer, options->options[i].data_begin, len);
+      bpf_probe_read(buffer, len, options->options[i].data_begin);
       buffer[len] = '\0';
       return;
     }
@@ -223,7 +222,7 @@ static inline void submit_event_to_ringbuf(struct dhcp_event *event) {
   struct dhcp_event *ringbuf_event =
       bpf_ringbuf_reserve(&dhcp_events, sizeof(*event), 0);
   if (ringbuf_event) {
-    __builtin_memcpy(ringbuf_event, event, sizeof(*event));
+    bpf_probe_read(ringbuf_event, sizeof(*event), event);
     bpf_ringbuf_submit(ringbuf_event, 0);
   }
 }
@@ -245,8 +244,8 @@ void handle_dhcp_request(struct dhcp_packet *packet,
 void handle_dhcp_release(struct dhcp_packet *packet) {
   struct dhcp_event event = {};
   event.msg_type = DHCP_MSG_TYPE_RELEASE;
-  __builtin_memcpy(event.ip_addr, &packet->ciaddr, sizeof(event.ip_addr));
-  __builtin_memcpy(event.mac_addr, packet->chaddr, sizeof(event.mac_addr));
+  bpf_probe_read(event.ip_addr, sizeof(event.ip_addr), &packet->ciaddr);
+  bpf_probe_read(event.mac_addr, sizeof(event.mac_addr), packet->chaddr);
 
   // Put the event into the ring buffer
   submit_event_to_ringbuf(&event);
@@ -269,8 +268,8 @@ void handle_dhcp_ack(struct dhcp_packet *packet, struct dhcp_options *options) {
   }
 
   event->msg_type = DHCP_MSG_TYPE_ACK;
-  __builtin_memcpy(event->mac_addr, packet->chaddr, sizeof(event->mac_addr));
-  __builtin_memcpy(event->ip_addr, &packet->yiaddr, sizeof(event->ip_addr));
+  bpf_probe_read(event->mac_addr, sizeof(event->mac_addr), packet->chaddr);
+  bpf_probe_read(event->ip_addr, sizeof(event->ip_addr), &packet->yiaddr);
   event->elepsed_secs = bpf_ntohs(packet->secs);
   fetch_dhcp_option_u32(options, DHCP_OPT_LEASE_TIME, &event->lease_time);
 
