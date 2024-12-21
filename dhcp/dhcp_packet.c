@@ -1,4 +1,4 @@
-// go:build ignore
+//go:build ignore
 
 #include <linux/types.h>
 
@@ -61,7 +61,7 @@ struct {
 
 struct {
   __uint(type, BPF_MAP_TYPE_RINGBUF);
-  __uint(max_entries, 2048);
+  __uint(max_entries, 4096);
 } dhcp_events SEC(".maps");
 
 struct dhcp_packet {

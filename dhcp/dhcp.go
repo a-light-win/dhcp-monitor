@@ -88,6 +88,12 @@ func convertBpfDhcpEvent(event bpfDhcpEvent) DhcpEvent {
 	}
 }
 
+func New(dhcpConfig *DhcpMonitorConfig) *DhcpMonitor {
+	return &DhcpMonitor{
+		Config: *dhcpConfig,
+	}
+}
+
 func (d *DhcpMonitor) Init() error {
 	if err := d.initBpfObjects(); err != nil {
 		return err
