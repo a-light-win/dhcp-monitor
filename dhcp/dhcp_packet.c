@@ -43,13 +43,13 @@ struct dhcp_options {
 };
 
 struct dhcp_event {
-  __u32 elepsed_secs; // seconds elapsed since client began address acquisition
+  __u32 elapsed_secs; // seconds elapsed since client began address acquisition
   __u32 lease_time;   // DHCP_OPT_LEASE_TIME in ACK
 
-  __u8 host[64];    // DHCP_OPT_HOST_NAME
-  __u8 ip_addr[4];  // DHCP_OPT_REQUESTED_IP, Your ip address
-  __u8 mac_addr[6]; // Client mac address
-  __u8 msg_type;    // request or release
+  __u8 hostname[64]; // DHCP_OPT_HOST_NAME
+  __u8 ip_addr[4];   // DHCP_OPT_REQUESTED_IP, Your ip address
+  __u8 mac_addr[6];  // Client mac address
+  __u8 msg_type;     // request or release
 };
 
 struct {
@@ -233,8 +233,8 @@ void handle_dhcp_request(struct dhcp_packet *packet,
   struct dhcp_event event = {};
   event.msg_type = DHCP_MSG_TYPE_REQUEST;
   // Extract host name from options
-  fetch_dhcp_option_str(options, DHCP_OPT_HOST_NAME, event.host,
-                        sizeof(event.host));
+  fetch_dhcp_option_str(options, DHCP_OPT_HOST_NAME, event.hostname,
+                        sizeof(event.hostname));
 
   // Add the event into the map with xid as the key
   bpf_map_update_elem(&dhcp_aquires, &packet->xid, &event, BPF_ANY);
@@ -270,7 +270,7 @@ void handle_dhcp_ack(struct dhcp_packet *packet, struct dhcp_options *options) {
   event->msg_type = DHCP_MSG_TYPE_ACK;
   bpf_probe_read(event->mac_addr, sizeof(event->mac_addr), packet->chaddr);
   bpf_probe_read(event->ip_addr, sizeof(event->ip_addr), &packet->yiaddr);
-  event->elepsed_secs = bpf_ntohs(packet->secs);
+  event->elapsed_secs = bpf_ntohs(packet->secs);
   fetch_dhcp_option_u32(options, DHCP_OPT_LEASE_TIME, &event->lease_time);
 
   // Submit the event to the ring buffer
