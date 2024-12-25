@@ -1,4 +1,5 @@
 dist/
 
+cmd_serve
 bpf_bpfeb.*
 bpf_bpfel.*

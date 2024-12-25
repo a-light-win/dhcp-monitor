@@ -120,7 +120,19 @@ func (d *DhcpMonitor) initInterfaces() error {
 }
 
 func (d *DhcpMonitor) initBpfObjects() error {
-	return loadBpfObjects(&d.bpfObjs, nil)
+	if err := loadBpfObjects(&d.bpfObjs, nil); err != nil {
+		return fmt.Errorf("failed to load BPF objects: %w", err)
+	}
+	if d.bpfObjs.DhcpIngressProc == nil {
+		return fmt.Errorf("BPF object DhcpIngressProc is nil")
+	}
+	if d.bpfObjs.DhcpEgressProc == nil {
+		return fmt.Errorf("BPF object DhcpEgressProc is nil")
+	}
+	if d.bpfObjs.DhcpEvents == nil {
+		return fmt.Errorf("BPF object DhcpEvents is nil")
+	}
+	return nil
 }
 
 func (d *DhcpMonitor) attachInterfaces() error {
@@ -161,6 +173,9 @@ func (d *DhcpMonitor) attachInterface(ifaceName string) error {
 }
 
 func (d *DhcpMonitor) Run() {
+	if d.bpfObjs.DhcpEvents == nil {
+		log.Fatalf("BPF object DhcpEvents is nil")
+	}
 	rd, err := ringbuf.NewReader(d.bpfObjs.DhcpEvents)
 	if err != nil {
 		log.Fatalf("creating ringbuf reader: %s", err)
