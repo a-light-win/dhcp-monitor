@@ -13,8 +13,7 @@
 #include <linux/pkt_cls.h>
 #include <linux/udp.h>
 
-#define MAX_DHCP_OPTIONS 10
-#define MAX_PARSED_DHCP_OPTIONS 5
+#define MAX_DHCP_OPTIONS 32
 
 const static __u32 DHCP_CLIENT_PORT = 68;
 const static __u32 DHCP_SERVER_PORT = 67;
@@ -26,6 +25,7 @@ enum {
 };
 
 enum {
+  DHCP_OPT_PAD = 0,           // 0x00
   DHCP_OPT_HOST_NAME = 12,    // 0x0c
   DHCP_OPT_REQUESTED_IP = 50, // 0x32
   DHCP_OPT_LEASE_TIME = 51,   // 0x33
@@ -35,6 +35,7 @@ enum {
 };
 
 struct dhcp_event {
+  __u32 xid;          // Transaction ID
   __u32 elapsed_secs; // seconds elapsed since client began address acquisition
   __u32 lease_time;   // DHCP_OPT_LEASE_TIME in ACK
 
@@ -55,6 +56,27 @@ struct {
   __uint(type, BPF_MAP_TYPE_RINGBUF);
   __uint(max_entries, 4096);
 } dhcp_events SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, __u32);
+} dhcp_packet_offset_percpu_map SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, struct dhcp_event);
+} dhcp_event_percpu_map SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, __u32);
+} dhcp_prog_array SEC(".maps");
 
 struct dhcp_packet {
   __u8 op;    // Message op code / message type. 1 = BOOTREQUEST, 2 = BOOTREPLY
@@ -82,114 +104,70 @@ struct dhcp_packet {
                    // in DHCPOFFER.
 };
 
-// Handle DHCP packets
-struct dhcp_packet_data {
-  struct __sk_buff *skb;
-  struct dhcp_packet *packet;
-  __u8 *options;
-  void *data_end;
-};
-
-// Calculate the offset to the DHCP payload within the packet
-int dhcp_payload_offset(void *data, void *data_end) {
-  int offset = 0;
-
-  // Ether header 14 bytes
-  int ethhdr_len = sizeof(struct ethhdr);
-  offset += ethhdr_len;
-  if (data + offset >= data_end) {
-    return -1;
-  }
-
-  // IP header
-  struct iphdr *iph = data + offset;
-  if ((void *)(iph + 1) >= data_end) {
-    return -1;
-  }
-  if (iph->protocol != IPPROTO_UDP) {
-    return -1;
-  }
-  offset += sizeof(*iph);
-  int ip_ext_len = iph->ihl * 4 - sizeof(*iph);
-  if (ip_ext_len > 0) {
-    offset += ip_ext_len;
-  }
-
-  // UDP header
-  if (data + offset >= data_end) {
-    return -1;
-  }
-  struct udphdr *udph = data + offset;
-  if ((void *)(udph + 1) >= data_end) {
-    return -1;
-  }
-  offset += sizeof(*udph);
-  return offset;
-}
-
-// Load the DHCP packet from the data
-struct dhcp_packet *load_dhcp_packet(void *data, void *data_end) {
-  int offset = dhcp_payload_offset(data, data_end);
-  if (offset < 0) {
-    return NULL;
-  }
-
-  struct dhcp_packet *dhcp = data + offset;
-  if ((void *)(dhcp + 1) > data_end) {
-    return NULL;
-  }
-
-  return dhcp;
-}
-
 // Get the DHCP message type from the options
-static __always_inline __u8
-get_dhcp_message_type(struct dhcp_packet_data *packet_data) {
-  __u8 *cursor = packet_data->options;
-  __u8 *data_end = (__u8 *)packet_data->data_end;
-  __u8 msg_type = 0;
-  for (__u8 count = 0; count < MAX_DHCP_OPTIONS; count++) {
+static inline int parse_dhcp_options(struct __sk_buff *skb,
+                                     struct dhcp_packet *packet,
+                                     struct dhcp_event *event) {
+  // pointer to options
+  __u8 *cursor = (__u8 *)(packet + 1);
+  __u8 *data_end = (__u8 *)(long)skb->data_end;
+
+  for (__u8 count = 0; count < 1; count++) {
     // check option type is valid
     if (cursor + 1 > data_end) {
-      break;
+      return -1;
     }
     __u8 option_type = *cursor;
-    if (option_type == DHCP_OPT_END) {
-      break;
-    }
     cursor++;
+    if (option_type == DHCP_OPT_PAD) {
+      continue;
+    }
+    if (option_type == DHCP_OPT_END) {
+      return 0;
+    }
 
     // check option length is valid
     if (cursor + 1 > data_end) {
-      break;
+      return -1;
     }
     // get option length
     __u8 option_len = *cursor;
     cursor++;
 
     if (option_type == DHCP_OPT_TYPE) {
-      if (option_len == 1 && cursor + option_len <= data_end) {
-        msg_type = *cursor;
+      if (option_len != 1 || cursor + 1 > data_end) {
+        return -1;
       }
-      break;
+      event->msg_type = *cursor;
+    } else if (option_type == DHCP_OPT_HOST_NAME) {
+      __u32 len = option_len > sizeof(event->hostname) ? sizeof(event->hostname)
+                                                       : option_len;
+      if (len <= 0 || cursor + len > data_end) {
+        return -1;
+      }
+      __u32 offset = cursor - (__u8 *)(long)skb->data;
+      bpf_skb_load_bytes(skb, offset, event->hostname, len);
+      event->hostname[len] = '\0';
+    } else if (option_type == DHCP_OPT_LEASE_TIME) {
+      if (option_len != sizeof(__u32) || cursor + option_len > data_end) {
+        return -1;
+      }
+      event->lease_time = bpf_ntohl(*(__u32 *)cursor);
     }
 
     cursor += option_len;
   }
-  return msg_type;
+
+  return 0;
 }
 
 // Parse the DHCP options from the packet
-static __always_inline void parse_dhcp(struct dhcp_event *event,
-                                       struct dhcp_packet_data *packet_data) {
-  struct dhcp_packet *packet = packet_data->packet;
-  struct __sk_buff *skb = packet_data->skb;
+static __always_inline int parse_event(struct __sk_buff *skb,
+                                       struct dhcp_packet *packet,
+                                       struct dhcp_event *event) {
   void *data = (void *)(long)skb->data;
-  __u8 *data_end = (__u8 *)packet_data->data_end;
-  __u8 *option_ptr = packet_data->options;
-
-  __u8 msg_type = get_dhcp_message_type(packet_data);
-  event->msg_type = msg_type;
+  __u8 *data_end = (__u8 *)(long)skb->data_end;
+  __u8 msg_type = event->msg_type;
 
   switch (msg_type) {
   case DHCP_MSG_TYPE_ACK: {
@@ -208,52 +186,7 @@ static __always_inline void parse_dhcp(struct dhcp_event *event,
     break;
   }
   }
-
-  // parse options by message type
-  if (msg_type != DHCP_MSG_TYPE_REQUEST && msg_type != DHCP_MSG_TYPE_ACK) {
-    return;
-  }
-  for (__u8 count = 0; count < MAX_DHCP_OPTIONS; count++) {
-    // check option type is valid
-    if (option_ptr + 1 > data_end) {
-      break;
-    }
-    __u8 option_type = *option_ptr++;
-    if (option_type == DHCP_OPT_END) {
-      break;
-    }
-
-    // check option length is valid
-    if (option_ptr + 1 > data_end) {
-      break;
-    }
-    // get option length
-    __u8 option_len = *option_ptr++;
-
-    if (msg_type == DHCP_MSG_TYPE_REQUEST) {
-      if (option_type == DHCP_OPT_HOST_NAME) {
-        __u32 len = option_len > sizeof(event->hostname)
-                        ? sizeof(event->hostname)
-                        : option_len;
-        if (len <= 0 || option_ptr + len > data_end) {
-          break;
-        }
-        bpf_skb_load_bytes(skb, (void *)option_ptr - data, event->hostname,
-                           len);
-        event->hostname[len] = '\0';
-      }
-    }
-    if (msg_type == DHCP_MSG_TYPE_ACK) {
-      if (option_type == DHCP_OPT_LEASE_TIME) {
-        if (option_len != sizeof(__u32) || option_ptr + option_len > data_end) {
-          break;
-        }
-        event->lease_time = bpf_ntohl(*(__u32 *)option_ptr);
-      }
-    }
-
-    option_ptr += option_len;
-  }
+  return 0;
 }
 
 // Submit the event to the ring buffer
@@ -267,8 +200,8 @@ static inline void submit_event_to_ringbuf(struct dhcp_event *event) {
 }
 
 // Handle DHCP request packets
-inline void handle_dhcp_request(__u32 xid, struct dhcp_event *event) {
-  bpf_map_update_elem(&dhcp_aquires, &xid, event, BPF_ANY);
+inline void handle_dhcp_request(struct dhcp_event *event) {
+  bpf_map_update_elem(&dhcp_aquires, &event->xid, event, BPF_ANY);
 }
 
 // Handle DHCP release packets
@@ -278,120 +211,157 @@ inline void handle_dhcp_release(struct dhcp_event *event) {
 }
 
 // Handle DHCP ACK packets
-inline void handle_dhcp_ack(__u32 xid, struct dhcp_event *event) {
+inline void handle_dhcp_ack(struct dhcp_event *event) {
   // Try to pop the event from the map
-  struct dhcp_event *cached_event = bpf_map_lookup_elem(&dhcp_aquires, &xid);
+  struct dhcp_event *cached_event =
+      bpf_map_lookup_elem(&dhcp_aquires, &event->xid);
   if (cached_event) {
     // Remove the event from the map
     __builtin_memcpy(event->hostname, cached_event->hostname,
                      sizeof(event->hostname));
-    bpf_map_delete_elem(&dhcp_aquires, &xid);
+    bpf_map_delete_elem(&dhcp_aquires, &event->xid);
   }
 
   submit_event_to_ringbuf(event);
 }
 
-// Handle DHCP ingress packets
-static __always_inline void
-handle_dhcp_ingress(struct dhcp_packet_data *packet_data) {
-  struct dhcp_event event = {};
-  parse_dhcp(&event, packet_data);
-
-  if (event.msg_type == DHCP_MSG_TYPE_RELEASE) {
-    handle_dhcp_release(&event);
-  } else if (event.msg_type == DHCP_MSG_TYPE_REQUEST) {
-    handle_dhcp_request(packet_data->packet->xid, &event);
-  }
-  // TODO: handle other packet types.
-}
-
-// Handle DHCP egress packets
-inline void handle_dhcp_egress(struct dhcp_packet_data *packet_data) {
-  struct dhcp_event event = {};
-  parse_dhcp(&event, packet_data);
-
-  if (event.msg_type == DHCP_MSG_TYPE_ACK) {
-    struct dhcp_event *event =
-        bpf_ringbuf_reserve(&dhcp_events, sizeof(struct dhcp_event), 0);
-    if (!event) {
-      return;
-    }
-    // Try to pop the event from the map
-    struct dhcp_packet *packet = packet_data->packet;
-    __u32 key = packet->xid;
-    struct dhcp_event *cached_event = bpf_map_lookup_elem(&dhcp_aquires, &key);
-    if (cached_event) {
-      // Remove the event from the map
-      bpf_probe_read(event, sizeof(*event), cached_event);
-      bpf_map_delete_elem(&dhcp_aquires, &key);
-    }
-
-    event->msg_type = DHCP_MSG_TYPE_ACK;
-    bpf_probe_read(event->mac_addr, sizeof(event->mac_addr), packet->chaddr);
-    bpf_probe_read(event->ip_addr, sizeof(event->ip_addr), &packet->yiaddr);
-    event->elapsed_secs = bpf_ntohs(packet->secs);
-
-    bpf_ringbuf_submit(event, 0);
-  }
-}
-
-int check_and_get_dhcp(struct __sk_buff *skb,
-                       struct dhcp_packet_data *packet_data) {
+static inline struct udphdr *parse_udp_header(struct __sk_buff *skb) {
   if (skb->protocol != bpf_htons(ETH_P_IP)) {
-    return -1;
-  }
-
-  __u32 local_port;
-  if (bpf_skb_load_bytes(skb, offsetof(struct __sk_buff, local_port),
-                         &local_port, sizeof(local_port)) < 0) {
-    return -1;
-  }
-  if (local_port != DHCP_SERVER_PORT) {
-    return -1;
+    return NULL;
   }
 
   void *data = (void *)(long)skb->data;
   void *data_end = (void *)(long)skb->data_end;
-  packet_data->packet = load_dhcp_packet(data, data_end);
-  if (packet_data->packet == NULL) {
-    return -1;
+
+  // Ether header
+  struct ethhdr *ether_header = data;
+  if ((void *)(ether_header + 1) > data_end) {
+    return NULL;
   }
-  packet_data->skb = skb;
-  packet_data->options = (__u8 *)(packet_data->packet + 1);
-  packet_data->data_end = data_end;
-  return 0;
+
+  // IP header
+  struct iphdr *ip_header = (void *)(ether_header + 1);
+  if ((void *)(ip_header + 1) > data_end) {
+    return NULL;
+  }
+
+  if (ip_header->protocol != IPPROTO_UDP) {
+    return NULL;
+  }
+  int ip_ext_len = ip_header->ihl * 4 - sizeof(*ip_header);
+
+  // UDP header
+  struct udphdr *udp_header = (void *)(ip_header + 1) + ip_ext_len;
+  if ((void *)(udp_header + 1) > data_end) {
+    return NULL;
+  }
+
+  return udp_header;
 }
 
-// Ingress processing function
-SEC("tcx/ingress")
-int dhcp_ingress_proc(struct __sk_buff *skb) {
-  struct dhcp_packet_data packet_data = {};
-  if (check_and_get_dhcp(skb, &packet_data) < 0) {
+static inline int from_dhcp_client(struct udphdr *udp_header) {
+  return udp_header->source == bpf_htons(DHCP_CLIENT_PORT) &&
+         udp_header->dest == bpf_htons(DHCP_SERVER_PORT);
+}
+
+static inline int from_dhcp_server(struct udphdr *udp_header) {
+  return udp_header->source == bpf_htons(DHCP_SERVER_PORT) &&
+         udp_header->dest == bpf_htons(DHCP_CLIENT_PORT);
+}
+
+int filter_dhcp(struct __sk_buff *skb) {
+  struct udphdr *udp_header = parse_udp_header(skb);
+  if (udp_header == NULL) {
     return TC_ACT_OK;
   }
-  handle_dhcp_ingress(&packet_data);
-  return TC_ACT_OK;
-}
 
-// Egress processing function
-SEC("tcx/egress")
-int dhcp_egress_proc(struct __sk_buff *skb) {
-  struct dhcp_packet_data packet_data = {};
+  if (!from_dhcp_client(udp_header) && !from_dhcp_server(udp_header)) {
+    return TC_ACT_OK;
+  }
+
+  void *data = (void *)(long)skb->data;
+  void *data_end = (void *)(long)skb->data_end;
+  struct dhcp_packet *packet = (void *)(udp_header + 1);
+  if ((void *)(packet + 1) > data_end) {
+    return TC_ACT_OK;
+  }
+
   struct dhcp_event event = {};
-  if (check_and_get_dhcp(skb, &packet_data) < 0) {
+  if (parse_dhcp_options(skb, packet, &event) < 0) {
     return TC_ACT_OK;
   }
-  if (packet_data.data_end == NULL || packet_data.packet == NULL ||
-      packet_data.options == NULL) {
+  if (parse_event(skb, packet, &event) < 0) {
     return TC_ACT_OK;
   }
-  parse_dhcp(&event, &packet_data);
 
-  if (event.msg_type == DHCP_MSG_TYPE_ACK) {
-    handle_dhcp_ack(packet_data.packet->xid, &event);
+  __u32 key = 0;
+  bpf_map_update_elem(&dhcp_event_percpu_map, &key, &event, BPF_ANY);
+
+  bpf_tail_call(skb, &dhcp_prog_array, 0);
+
+  return TC_ACT_OK;
+}
+
+/*
+SEC("tcx/parse_dhcp")
+int parse_dhcp(struct __sk_buff *skb) {
+  __u32 key = 0;
+  __u32 *offset = bpf_map_lookup_elem(&dhcp_packet_offset_percpu_map, &key);
+  if (!offset) {
+    return TC_ACT_OK;
+  }
+
+  void *data = (void *)(long)skb->data;
+  void *data_end = (void *)(long)skb->data_end;
+  struct dhcp_packet *packet = data + *offset;
+  if ((void *)(packet + 1) > data_end) {
+    return TC_ACT_OK;
+  }
+  struct dhcp_event event = {};
+  if (parse_dhcp_options(skb, packet, &event) < 0) {
+    return TC_ACT_OK;
+  }
+  if (parse_event(skb, packet, &event) < 0) {
+    return TC_ACT_OK;
+  }
+
+  bpf_map_update_elem(&dhcp_event_percpu_map, &key, &event, BPF_ANY);
+
+  bpf_tail_call(skb, &dhcp_prog_array, 1);
+
+  return TC_ACT_OK;
+}
+*/
+
+SEC("tcx/handle_dhcp")
+int handle_dhcp(struct __sk_buff *skb) {
+  __u32 key = 0;
+  struct dhcp_event *event = bpf_map_lookup_elem(&dhcp_event_percpu_map, &key);
+  if (!event) {
+    return TC_ACT_OK;
+  }
+
+  switch (event->msg_type) {
+  case DHCP_MSG_TYPE_REQUEST:
+    handle_dhcp_request(event);
+    break;
+  case DHCP_MSG_TYPE_RELEASE:
+    handle_dhcp_release(event);
+    break;
+  case DHCP_MSG_TYPE_ACK:
+    handle_dhcp_ack(event);
+    break;
   }
 
   return TC_ACT_OK;
+}
+
+SEC("tcx/ingress") int dhcp_ingress_proc(struct __sk_buff *skb) {
+  return filter_dhcp(skb);
+}
+
+SEC("tcx/egress") int dhcp_egress_proc(struct __sk_buff *skb) {
+  return filter_dhcp(skb);
 }
 
 char __license[] SEC("license") = "Dual MIT/GPL";

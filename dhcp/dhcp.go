@@ -8,9 +8,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"net/http"
+	"os"
+
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -20,8 +23,8 @@ import (
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -tags linux -type dhcp_event bpf dhcp_packet.c
 
 type DhcpMonitorConfig struct {
-	IfaceNmes  []string
-	WebhookURL string
+	WebhookURL string   `validate:"required" help:"URL to send DHCP events to"`
+	IfaceNames []string `help:"Network interfaces to monitor DHCP traffic on"`
 }
 
 type DhcpMonitor struct {
@@ -105,17 +108,33 @@ func (d *DhcpMonitor) Init() error {
 }
 
 func (d *DhcpMonitor) initInterfaces() error {
-	if len(d.Config.IfaceNmes) == 0 {
+	if len(d.Config.IfaceNames) == 0 {
 		interfaces, err := net.Interfaces()
 		if err != nil {
 			return err
 		}
 		for _, iface := range interfaces {
 			if iface.Name != "lo" {
-				d.Config.IfaceNmes = append(d.Config.IfaceNmes, iface.Name)
+				d.Config.IfaceNames = append(d.Config.IfaceNames, iface.Name)
 			}
 		}
 	}
+	// Set the dhcp_prog_array with the program file descriptors
+	if err := d.setDhcpProgArray(); err != nil {
+		return fmt.Errorf("failed to set dhcp_prog_array: %w", err)
+	}
+
+	return nil
+}
+
+func (d *DhcpMonitor) setDhcpProgArray() error {
+	progArray := d.bpfObjs.DhcpProgArray
+
+	// Update the dhcp_prog_array with the program file descriptors
+	if err := progArray.Put(uint32(0), uint32(d.bpfObjs.HandleDhcp.FD())); err != nil {
+		return fmt.Errorf("failed to set handle program in dhcp_prog_array: %w", err)
+	}
+
 	return nil
 }
 
@@ -132,11 +151,12 @@ func (d *DhcpMonitor) initBpfObjects() error {
 	if d.bpfObjs.DhcpEvents == nil {
 		return fmt.Errorf("BPF object DhcpEvents is nil")
 	}
+
 	return nil
 }
 
 func (d *DhcpMonitor) attachInterfaces() error {
-	for _, ifaceName := range d.Config.IfaceNmes {
+	for _, ifaceName := range d.Config.IfaceNames {
 		if err := d.attachInterface(ifaceName); err != nil {
 			return err
 		}
@@ -144,8 +164,14 @@ func (d *DhcpMonitor) attachInterfaces() error {
 	return nil
 }
 
+var logger = zerolog.New(os.Stderr).With().Timestamp().Logger()
+
 func (d *DhcpMonitor) attachInterface(ifaceName string) error {
 	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		log.Warn().Err(err).Str("Interface", ifaceName).Msg("Failed to get interface by name")
+		return err
+	}
 
 	linkIngress, err := link.AttachTCX(link.TCXOptions{
 		Interface: iface.Index,
@@ -155,7 +181,7 @@ func (d *DhcpMonitor) attachInterface(ifaceName string) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("Attached TCx program to INGRESS iface %q (index %d)", iface.Name, iface.Index)
+	logger.Info().Str("Interface", iface.Name).Int("Infex", iface.Index).Msg("Attached TCX program to ingress")
 	d.links = append(d.links, linkIngress)
 
 	// Attach the program to Egress TC.
@@ -167,18 +193,18 @@ func (d *DhcpMonitor) attachInterface(ifaceName string) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("Attached TCx program to INGRESS iface %q (index %d)", iface.Name, iface.Index)
+	logger.Info().Str("Interface", iface.Name).Int("Infex", iface.Index).Msg("Attached TCX program to egress")
 	d.links = append(d.links, linkEgress)
 	return nil
 }
 
 func (d *DhcpMonitor) Run() {
 	if d.bpfObjs.DhcpEvents == nil {
-		log.Fatalf("BPF object DhcpEvents is nil")
+		logger.Fatal().Msg("BPF object DhcpEvents is nil")
 	}
 	rd, err := ringbuf.NewReader(d.bpfObjs.DhcpEvents)
 	if err != nil {
-		log.Fatalf("creating ringbuf reader: %s", err)
+		logger.Fatal().Msgf("creating ringbuf reader: %s", err)
 	}
 	defer rd.Close()
 
@@ -186,22 +212,24 @@ func (d *DhcpMonitor) Run() {
 		record, err := rd.Read()
 		if err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
-				log.Println("ringbuf reader closed, exiting")
+				logger.Info().Msg("ringbuf reader closed, exiting")
 				return
 			}
-			log.Printf("reading from ringbuf: %s", err)
+			logger.Info().Msgf("reading from ringbuf: %s", err)
 			continue
 		}
 
 		var event bpfDhcpEvent
 		if err := binary.Read(bytes.NewReader(record.RawSample), hostByteOrder, &event); err != nil {
-			log.Printf("decoding event: %s", err)
+			logger.Info().Msgf("decoding event: %s", err)
 			continue
 		}
 
 		dhcpEvent := convertBpfDhcpEvent(event)
+		log.Debug().Msgf("Receive event: %v", event)
+
 		if err := d.sendToWebhook(dhcpEvent); err != nil {
-			log.Printf("sending to webhook: %s", err)
+			logger.Info().Msgf("sending to webhook: %s", err)
 		}
 	}
 }
