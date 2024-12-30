@@ -4,8 +4,8 @@ import (
 	config "github.com/a-light-win/dhcp-monitor/configs/dhcp"
 	monitor "github.com/a-light-win/dhcp-monitor/gen/ebpf/dhcp"
 	"github.com/a-light-win/dhcp-monitor/pkg/logger"
+	"github.com/go-playground/validator/v10"
 	"github.com/rs/zerolog/log"
-	"github.com/sacloud/packages-go/validate"
 )
 
 type ServeCmd struct {
@@ -15,9 +15,8 @@ type ServeCmd struct {
 }
 
 func (s *ServeCmd) Run() error {
-	validator := validate.New()
-	if err := validator.Struct(&s.DhcpMonitorConfig); err != nil {
-		log.Error().Err(err).Msg("config validation failed")
+	validate := validator.New()
+	if err := validate.Struct(&s.DhcpMonitorConfig); err != nil {
 		return err
 	}
 
