@@ -5,36 +5,29 @@ package dhcp
 import (
 	"bytes"
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
-	"net/http"
-	"os"
 	"time"
 
-	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
+
+	config "github.com/a-light-win/dhcp-monitor/configs/dhcp"
+	"github.com/a-light-win/dhcp-monitor/pkg/dhcp"
 )
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -tags linux bpf dhcp_packet.c
-
-type DhcpMonitorConfig struct {
-	WebhookURL string   `validate:"required" help:"URL to send DHCP events to"`
-	IfaceNames []string `help:"Network interfaces to monitor DHCP traffic on"`
-}
 
 type DhcpMonitor struct {
 	bpfObjs bpfObjects
 	links   []link.Link
 
-	Config DhcpMonitorConfig
-
-	cachedEvents []DhcpEvent
+	Config      *config.DhcpMonitorConfig
+	DhcpHandler dhcp.Handler
 }
 
 type bpfDhcpEvent struct {
@@ -47,28 +40,7 @@ type bpfDhcpEvent struct {
 	Options    [312]uint8
 }
 
-type DhcpEvent struct {
-	Xid       uint32    `json:"-"`
-	Timestamp time.Time `json:"-"`
-
-	IpAddr      string `json:"ip_addr"`
-	MacAddr     string `json:"mac_addr"`
-	Hostname    string `json:"hostname"`
-	ElapsedSecs uint16 `json:"elapsed_secs"`
-	LeaseTime   uint32 `json:"lease_time"`
-	MsgType     string `json:"msg_type"`
-}
-
 const (
-	DHCPDiscover = 1
-	DHCPOffer    = 2
-	DHCPRequest  = 3
-	DHCPDecline  = 4
-	DHCPAck      = 5
-	DHCPNak      = 6
-	DHCPRelease  = 7
-	DHCPInform   = 8
-
 	DHCPOptPad         = 0   // 0x00
 	DHCPOptHostName    = 12  // 0x0c
 	DHCPOptRequestedIP = 50  // 0x32
@@ -78,8 +50,8 @@ const (
 	DHCPOptEnd         = 255 // 0xff
 )
 
-func convertBpfDhcpEvent(bpfEvent *bpfDhcpEvent) (*DhcpEvent, error) {
-	event := DhcpEvent{
+func convertBpfDhcpEvent(bpfEvent *bpfDhcpEvent) (*dhcp.DhcpEvent, error) {
+	event := dhcp.DhcpEvent{
 		Timestamp: time.Now(),
 	}
 	if err := parseDhcpOptions(bpfEvent, &event); err != nil {
@@ -88,9 +60,9 @@ func convertBpfDhcpEvent(bpfEvent *bpfDhcpEvent) (*DhcpEvent, error) {
 
 	// Set IpAddr based on MsgType
 	switch event.MsgType {
-	case "DHCP Release":
+	case dhcp.DHCPRelease:
 		event.IpAddr = net.IP(bpfEvent.Ciaddr[:]).String()
-	case "DHCP Ack":
+	case dhcp.DHCPAck:
 		event.IpAddr = net.IP(bpfEvent.Yiaddr[:]).String()
 	default:
 		event.IpAddr = net.IP(bpfEvent.Ciaddr[:]).String()
@@ -104,7 +76,7 @@ func convertBpfDhcpEvent(bpfEvent *bpfDhcpEvent) (*DhcpEvent, error) {
 	return &event, nil
 }
 
-func parseDhcpOptions(bpfEvent *bpfDhcpEvent, event *DhcpEvent) error {
+func parseDhcpOptions(bpfEvent *bpfDhcpEvent, event *dhcp.DhcpEvent) error {
 	if bpfEvent.OptionsLen == 0 {
 		return errors.New("DHCP options length is zero")
 	}
@@ -148,7 +120,7 @@ func parseDhcpOptions(bpfEvent *bpfDhcpEvent, event *DhcpEvent) error {
 			if len(value) != 1 {
 				return errors.New("invalid message type length")
 			}
-			event.MsgType = dhcpMsgTypeToString(value[0])
+			event.MsgType = dhcp.DhcpMsgType(value[0])
 		}
 		i += length
 	}
@@ -156,9 +128,10 @@ func parseDhcpOptions(bpfEvent *bpfDhcpEvent, event *DhcpEvent) error {
 	return nil
 }
 
-func New(dhcpConfig *DhcpMonitorConfig) *DhcpMonitor {
+func New(dhcpConfig *config.DhcpMonitorConfig) *DhcpMonitor {
 	return &DhcpMonitor{
-		Config: *dhcpConfig,
+		Config:      dhcpConfig,
+		DhcpHandler: &dhcp.DhcpHandler{Config: dhcpConfig},
 	}
 }
 
@@ -214,8 +187,6 @@ func (d *DhcpMonitor) attachInterfaces() error {
 	return nil
 }
 
-var logger = zerolog.New(os.Stderr).With().Timestamp().Logger()
-
 func (d *DhcpMonitor) attachInterface(ifaceName string) error {
 	iface, err := net.InterfaceByName(ifaceName)
 	if err != nil {
@@ -231,7 +202,7 @@ func (d *DhcpMonitor) attachInterface(ifaceName string) error {
 	if err != nil {
 		return err
 	}
-	logger.Info().Str("Interface", iface.Name).Int("Infex", iface.Index).Msg("Attached TCX program to ingress")
+	log.Info().Str("Interface", iface.Name).Int("Infex", iface.Index).Msg("Attached TCX program to ingress")
 	d.links = append(d.links, linkIngress)
 
 	// Attach the program to Egress TC.
@@ -243,18 +214,18 @@ func (d *DhcpMonitor) attachInterface(ifaceName string) error {
 	if err != nil {
 		return err
 	}
-	logger.Info().Str("Interface", iface.Name).Int("Infex", iface.Index).Msg("Attached TCX program to egress")
+	log.Info().Str("Interface", iface.Name).Int("Infex", iface.Index).Msg("Attached TCX program to egress")
 	d.links = append(d.links, linkEgress)
 	return nil
 }
 
 func (d *DhcpMonitor) Run() {
 	if d.bpfObjs.DhcpEvents == nil {
-		logger.Fatal().Msg("BPF object DhcpEvents is nil")
+		log.Fatal().Msg("BPF object DhcpEvents is nil")
 	}
 	rd, err := ringbuf.NewReader(d.bpfObjs.DhcpEvents)
 	if err != nil {
-		logger.Fatal().Msgf("creating ringbuf reader: %s", err)
+		log.Fatal().Msgf("creating ringbuf reader: %s", err)
 	}
 	defer rd.Close()
 
@@ -262,16 +233,16 @@ func (d *DhcpMonitor) Run() {
 		record, err := rd.Read()
 		if err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
-				logger.Info().Msg("ringbuf reader closed, exiting")
+				log.Info().Msg("ringbuf reader closed, exiting")
 				return
 			}
-			logger.Info().Msgf("reading from ringbuf: %s", err)
+			log.Info().Msgf("reading from ringbuf: %s", err)
 			continue
 		}
 
 		var event bpfDhcpEvent
 		if err := binary.Read(bytes.NewReader(record.RawSample), hostByteOrder, &event); err != nil {
-			logger.Info().Msgf("decoding event: %s", err)
+			log.Info().Msgf("decoding event: %s", err)
 			continue
 		}
 
@@ -281,97 +252,7 @@ func (d *DhcpMonitor) Run() {
 			continue
 		}
 
-		d.handleDhcpEvent(dhcpEvent)
-	}
-}
-
-func (d *DhcpMonitor) handleDhcpEvent(event *DhcpEvent) {
-	log.Debug().Str("MsgType", event.MsgType).
-		Str("IpAddr", event.IpAddr).
-		Str("MacAddr", event.MacAddr).
-		Str("Hostname", event.Hostname).
-		Msg("Receive dhcp event")
-
-	switch event.MsgType {
-	case "DHCP Request":
-		d.removeExpiredCacheEvents()
-		d.cachedEvents = append(d.cachedEvents, *event)
-	case "DHCP Ack":
-		d.updateHostname(event)
-		d.sendToWebhook(event)
-	case "DHCP Release":
-		d.sendToWebhook(event)
-	default:
-	}
-}
-
-func (d *DhcpMonitor) updateHostname(event *DhcpEvent) {
-	for i, cachedEvent := range d.cachedEvents {
-		if cachedEvent.Xid == event.Xid && cachedEvent.MacAddr == event.MacAddr {
-			d.cachedEvents = append(d.cachedEvents[:i], d.cachedEvents[i+1:]...)
-			event.Hostname = cachedEvent.Hostname
-			return
-		}
-	}
-}
-
-func (d *DhcpMonitor) removeExpiredCacheEvents() {
-	for i, event := range d.cachedEvents {
-		if time.Since(event.Timestamp) > time.Minute {
-			d.cachedEvents = append(d.cachedEvents[:i], d.cachedEvents[i+1:]...)
-		} else {
-			// Fast break on first non expired event
-			break
-		}
-	}
-}
-
-func (d *DhcpMonitor) sendToWebhook(event *DhcpEvent) {
-	log.Info().Str("MsgType", event.MsgType).
-		Str("IpAddr", event.IpAddr).
-		Str("MacAddr", event.MacAddr).
-		Str("Hostname", event.Hostname).
-		Msg("Send dhcp event to webhook")
-
-	data, err := json.Marshal(event)
-	if err != nil {
-		log.Error().Err(err).Msg("Failed to marshal event before sending to webhook")
-		return
-	}
-
-	resp, err := http.Post(d.Config.WebhookURL, "application/json", bytes.NewBuffer(data))
-	if err != nil {
-		log.Error().Err(err).Msg("Failed to send event to webhook")
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		err := fmt.Errorf("received non-200 response: %d", resp.StatusCode)
-		log.Error().Err(err).Msg("Failed to send event to webhook")
-	}
-}
-
-func dhcpMsgTypeToString(msgType uint8) string {
-	switch msgType {
-	case DHCPDiscover:
-		return "DHCP Discover"
-	case DHCPOffer:
-		return "DHCP Offer"
-	case DHCPRequest:
-		return "DHCP Request"
-	case DHCPDecline:
-		return "DHCP Decline"
-	case DHCPAck:
-		return "DHCP Ack"
-	case DHCPNak:
-		return "DHCP Nak"
-	case DHCPRelease:
-		return "DHCP Release"
-	case DHCPInform:
-		return "DHCP Inform"
-	default:
-		return "Unknown"
+		d.DhcpHandler.Handle(dhcpEvent)
 	}
 }
 

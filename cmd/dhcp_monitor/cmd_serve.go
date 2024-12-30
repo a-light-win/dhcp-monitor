@@ -1,14 +1,15 @@
 package main
 
 import (
-	"github.com/a-light-win/dhcp-monitor/dhcp"
-	"github.com/a-light-win/dhcp-monitor/logger"
+	config "github.com/a-light-win/dhcp-monitor/configs/dhcp"
+	monitor "github.com/a-light-win/dhcp-monitor/gen/ebpf/dhcp"
+	"github.com/a-light-win/dhcp-monitor/pkg/logger"
 	"github.com/rs/zerolog/log"
 	"github.com/sacloud/packages-go/validate"
 )
 
 type ServeCmd struct {
-	dhcp.DhcpMonitorConfig
+	config.DhcpMonitorConfig
 
 	LogLevel logger.LogLevel `enum:"debug,info,warn,error,fatal" help:"Set the log level" default:"info"`
 }
@@ -32,7 +33,7 @@ func (s *ServeCmd) Run() error {
 		Strs("IfaceNames", monitorConfig.IfaceNames).
 		Msg("Core config")
 
-	monitor := dhcp.New(&monitorConfig)
+	monitor := monitor.New(&monitorConfig)
 	if err := monitor.Init(); err != nil {
 		log.Error().Err(err).Msg("failed to initialize dhcp monitor")
 		return err
