@@ -14,6 +14,7 @@
 #include <linux/udp.h>
 
 #define DHCP_OPTIONS_LEN 312
+#define DHCP_MAGIC_COOKIE 0x63825363
 
 const static __u32 DHCP_CLIENT_PORT = 68;
 const static __u32 DHCP_SERVER_PORT = 67;
@@ -42,7 +43,7 @@ struct dhcp_packet {
   __u8 file[128];  // Boot file name, null terminated string; "generic" name or
                    // null in DHCPDISCOVER, fully qualified directory-path name
                    // in DHCPOFFER.
-  __u8 magic[4];   // 0x63825363
+  __u32 magic;     // 0x63825363
 };
 
 // Note that any fields changed in here should
@@ -125,6 +126,10 @@ int handle_dhcp(struct __sk_buff *skb) {
   void *data_end = (void *)(long)skb->data_end;
   struct dhcp_packet *packet = (void *)(udp_header + 1);
   if ((void *)(packet + 1) > data_end) {
+    return TC_ACT_OK;
+  }
+
+  if (packet->magic != bpf_htonl(DHCP_MAGIC_COOKIE)) {
     return TC_ACT_OK;
   }
 
