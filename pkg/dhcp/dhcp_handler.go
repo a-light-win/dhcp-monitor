@@ -31,6 +31,8 @@ func (d *DhcpHandler) Handle(event *DhcpEvent) {
 
 	switch event.MsgType {
 	case DHCPRequest:
+		fallthrough
+	case DHCPDiscover:
 		d.removeExpiredCacheEvents()
 		d.cachedEvents = append(d.cachedEvents, *event)
 	case DHCPAck:
