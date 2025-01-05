@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+
+update() {
+  local version="$1"
+
+  sed -i 's/PKG_VERSION=.*/PKG_VERSION='"$version"'/g' builder-env
+  sed -i 's/\(\s\+Version\s*=\s*\)"[^"]*"/\1"'"$version"'"/g' cmd/dhcp_monitor/cmd_version.go
+}
+
+update "$@"

@@ -20,7 +20,7 @@ import (
 	"github.com/a-light-win/dhcp-monitor/pkg/dhcp"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -tags linux bpf dhcp_packet.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "$CGO_CFLAGS" -tags linux bpf dhcp_packet.c
 
 type DhcpMonitor struct {
 	bpfObjs bpfObjects

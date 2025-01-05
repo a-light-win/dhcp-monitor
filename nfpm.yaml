@@ -1,0 +1,46 @@
+---
+name: "dhcp-monitor"
+arch: "${PKG_ARCH}"
+platform: "${PKG_PLATFORM}"
+version: "${PKG_VERSION}"
+section: "net"
+priority: "optional"
+maintainer: "Songmin Li <lisongmin@protonmail.com>"
+description: Listen on DHCP packets and send them to a remote server.
+vendor: "a-light.win"
+homepage: "https://github.com/a-light-win/dhcp-monitor"
+license: "MIT"
+
+provides:
+  - dhcp-monitor
+recommends: []
+suggests: []
+conflicts: []
+replaces: []
+scripts:
+  postinstall: "./misc/scripts/postinstall.sh"
+  postremove: "./misc/scripts/postremove.sh"
+
+contents:
+  - src: ./dist/bin/dhcp-monitor
+    dst: /usr/bin/dhcp-monitor
+    type: file
+    file_info:
+      mode: 0755
+  - src: ./misc/systemd/dhcp-monitor.service
+    dst: /usr/lib/systemd/system/dhcp-monitor.service
+    type: file
+    file_info:
+      mode: 0644
+  - src: ./LICENSE
+    dst: /usr/share/licenses/dhcp-monitor/LICENSE
+    type: file
+    file_info:
+      mode: 0644
+  - dst: /etc/dhcp-monitor
+    type: dir
+    file_info:
+      mode: 0755
+
+archlinux:
+  packager: "Songmin Li <lisongmin@protonmail.com>"

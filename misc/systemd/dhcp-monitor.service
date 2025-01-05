@@ -1,0 +1,37 @@
+[Unit]
+Description=DHCP Monitor Service
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/dhcp-monitor serve
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+
+# Set the user and group to run the service with minimal privileges
+User=dhcp-monitor
+Group=dhcp-monitor
+
+# Set the working directory
+WorkingDirectory=/etc/dhcp-monitor
+
+# Capabilities and security settings
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=true
+
+# Restrict the service's access to the filesystem
+ProtectSystem=full
+ProtectHome=true
+ReadOnlyPaths=/usr/bin/dhcp-monitor /etc/dhcp-monitor
+
+# Restrict the service's access to the network
+PrivateDevices=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+
+[Install]
+WantedBy=multi-user.target
+
